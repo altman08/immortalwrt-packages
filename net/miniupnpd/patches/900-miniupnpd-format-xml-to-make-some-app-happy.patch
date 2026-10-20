@@ -1,4 +1,4 @@
-From 7651a23732d234f97137ca160a0c157eaed43ae8 Mon Sep 17 00:00:00 2001
+From bfff67fb27c4327d2a43b61ea1ad0559bfe60e29 Mon Sep 17 00:00:00 2001
 From: Chen Minqiang <ptpt52@gmail.com>
 Date: Wed, 29 Sep 2021 22:29:53 +0800
 Subject: [PATCH] miniupnpd: format xml to make some app happy
