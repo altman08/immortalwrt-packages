@@ -2,14 +2,14 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=xray-core
 PKG_VERSION:=26.10.21
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://codeload.github.com/XTLS/Xray-core/tar.gz/v$(PKG_VERSION)?
 PKG_HASH:=44ef4874529a03848c90f1fdcfb763350fbc5f1de741ec90e0024d651df25650
 
 PKG_MAINTAINER:=Tianling Shen <cnsztl@immortalwrt.org>
-PKG_LICENSE:=MPL-2.0
+PKG_LICENSE:=MPL-2.0 BSD-3-Clause
 PKG_LICENSE_FILES:=LICENSE
 
 PKG_BUILD_DIR:=$(BUILD_DIR)/Xray-core-$(PKG_VERSION)
@@ -26,6 +26,15 @@ GO_PKG_LDFLAGS_X:= \
 include $(INCLUDE_DIR)/package.mk
 include ../../lang/golang/golang-package.mk
 
+# Keep the overlay private to Xray; runtime DT detection gates AN7581 use.
+# Generate it with the same versioned Go environment as the package build.
+ifeq ($(GO_ARCH),arm64)
+  define Build/Compile
+	$(GO_PKG_VARS) python3 $(PKG_BUILD_DIR)/tools/eip93/overlay.py --go go --out $(PKG_BUILD_DIR)/.eip93-overlay
+	$(call GoPackage/Build/Compile,-overlay=$(PKG_BUILD_DIR)/.eip93-overlay/overlay.json)
+  endef
+endif
+
 define Package/xray/template
   TITLE:=A proxy platform to bypass network restrictions
   SECTION:=net
@@ -35,7 +44,10 @@ endef
 
 define Package/xray-core
   $(call Package/xray/template)
-  DEPENDS:=$(GO_ARCH_DEPENDS) +ca-bundle
+  DEPENDS:=$(GO_ARCH_DEPENDS) +ca-bundle \
+	+TARGET_airoha_an7581:kmod-crypto-hw-eip93 \
+	+TARGET_airoha_an7581:kmod-crypto-gcm \
+	+TARGET_airoha_an7581:kmod-crypto-user
 endef
 
 define Package/xray-example
