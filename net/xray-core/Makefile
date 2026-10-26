@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=xray-core
 PKG_VERSION:=26.10.21
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://codeload.github.com/XTLS/Xray-core/tar.gz/v$(PKG_VERSION)?
@@ -46,6 +46,7 @@ define Package/xray-core
   $(call Package/xray/template)
   DEPENDS:=$(GO_ARCH_DEPENDS) +ca-bundle \
 	+TARGET_airoha_an7581:kmod-crypto-hw-eip93 \
+	+TARGET_airoha_an7581:kmod-crypto-cbc \
 	+TARGET_airoha_an7581:kmod-crypto-gcm \
 	+TARGET_airoha_an7581:kmod-crypto-user
 endef
