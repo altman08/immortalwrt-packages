@@ -1,0 +1,1025 @@
+Subject: [PATCH] crypto: prefer devcrypto for AN7581 AES-GCM and AES-CBC
+
+Add a shared Linux cryptodev 1.14 transport to the private Xray Go overlay.
+Verify the selected EIP93 driver and each session before application data.
+Preserve software fallback, authentication rejection and CBC IV semantics.
+
+XRAY_EIP93 unset/auto selects devcrypto, then AF_ALG, then Go software.
+Explicit devcrypto/afalg select that transport with Go software fallback;
+off disables acceleration. Keep device/CPU/FIPS gating and payload limits.
+No package dependencies, startup scripts or UCI configuration are changed.
+
+--- a/tools/eip93/devcrypto_linux.go.in
++++ b/tools/eip93/devcrypto_linux.go.in
+@@ -0,0 +1,277 @@
++// Copyright 2026 The PonWrt Authors.
++// SPDX-License-Identifier: BSD-3-Clause
++//go:build linux && (amd64 || arm64) && !purego
++
++// Package eip93dev implements the cryptodev transport for Xray's private overlay.
++// Selection, key schedules and software cryptography remain in the AES modes.
++package eip93dev
++
++import (
++	"bytes"
++	"errors"
++	"os"
++	"runtime"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"unsafe"
++)
++
++type Backend uint8
++
++const (
++	Auto Backend = iota
++	Devcrypto
++	AFALG
++	Off
++)
++
++// XRAY_EIP93 is read once per process. Explicit transports fall back only to
++// Go software; auto tries devcrypto, then AF_ALG, then Go software.
++func ParseBackend(value string) Backend {
++	switch value {
++	case "", "auto":
++		return Auto
++	case "devcrypto":
++		return Devcrypto
++	case "afalg":
++		return AFALG
++	case "off":
++		return Off
++	default:
++		return Off
++	}
++}
++
++var policy = sync.OnceValue(func() Backend {
++	value := os.Getenv("XRAY_EIP93")
++	b := ParseBackend(value)
++	if b == Off && value != "off" {
++		println("Xray EIP93: unknown XRAY_EIP93 value; acceleration disabled:", value)
++	}
++	return b
++})
++
++func Policy() Backend { return policy() }
++
++const (
++	CBC         = 11 // CRYPTO_AES_CBC
++	GCM         = 50 // CRYPTO_AES_GCM
++	MaxPayload  = 32768
++	MaxSessions = 128 // Shared between CBC and GCM devcrypto sessions.
++)
++
++var sessions atomic.Int32
++var ErrSelftest = errors.New("EIP93 per-session verification failed")
++
++// Linux cryptodev 1.14 UAPI, little-endian ARM64 ABI.
++// https://github.com/cryptodev-linux/cryptodev-linux/blob/cryptodev-linux-1.14/crypto/cryptodev.h
++type sessionOp struct {
++	Cipher, MAC, KeyLen uint32
++	Key                 *byte
++	MACKeyLen           uint32
++	MACKey              *byte
++	Session             uint32
++}
++
++type algorithmInfo struct{ Name, Driver [64]byte }
++type sessionInfo struct {
++	Session      uint32
++	Cipher, Hash algorithmInfo
++	AlignMask    uint16
++	Flags        uint32
++}
++
++type authOp struct {
++	Session                uint32
++	Op, Flags              uint16
++	Len, AuthLen           uint32
++	AuthSrc, Src, Dst, Tag *byte
++	TagLen                 uint32
++	IV                     *byte
++	IVLen                  uint32
++}
++
++type cryptOp struct {
++	Session           uint32
++	Op, Flags         uint16
++	Len               uint32
++	Src, Dst, MAC, IV *byte
++}
++
++var (
++	_ [48 - unsafe.Sizeof(sessionOp{})]byte
++	_ [unsafe.Sizeof(sessionOp{}) - 48]byte
++	_ [268 - unsafe.Sizeof(sessionInfo{})]byte
++	_ [unsafe.Sizeof(sessionInfo{}) - 268]byte
++	_ [72 - unsafe.Sizeof(authOp{})]byte
++	_ [unsafe.Sizeof(authOp{}) - 72]byte
++	_ [48 - unsafe.Sizeof(cryptOp{})]byte
++	_ [unsafe.Sizeof(cryptOp{}) - 48]byte
++)
++
++const (
++	getSession = uintptr(3<<30 | unsafe.Sizeof(sessionOp{})<<16 | 'c'<<8 | 102)
++	endSession = uintptr(1<<30 | 4<<16 | 'c'<<8 | 103)
++	crypt      = uintptr(3<<30 | unsafe.Sizeof(cryptOp{})<<16 | 'c'<<8 | 104)
++	getInfo    = uintptr(3<<30 | unsafe.Sizeof(sessionInfo{})<<16 | 'c'<<8 | 107)
++	authCrypt  = uintptr(3<<30 | unsafe.Sizeof(authOp{})<<16 | 'c'<<8 | 109)
++)
++
++func ioctl(fd int, request uintptr, arg unsafe.Pointer) error {
++	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), request, uintptr(arg))
++	runtime.KeepAlive(arg)
++	if errno != 0 {
++		return errno
++	}
++	return nil
++}
++
++func alignedBytes(n int, mask uint16) []byte {
++	b := make([]byte, n+int(mask))
++	offset := int(-uintptr(unsafe.Pointer(&b[0])) & uintptr(mask))
++	return b[offset : offset+n : offset+n]
++}
++
++// Session is owned and serialized by its AES mode. An ioctl is synchronous;
++// socket timeouts do not apply to /dev/crypto and cannot abort a stuck DMA.
++type Session struct {
++	fd                  int
++	id                  uint32
++	hasSession          bool
++	cipher              uint32
++	call                func(int, uintptr, unsafe.Pointer) error
++	buffer, aad, iv     []byte
++	bufferUsed, aadUsed int
++}
++
++func Open(key []byte, cipher uint32) (*Session, error) {
++	return openSession(key, cipher, "/dev/crypto", ioctl)
++}
++
++func openSession(key []byte, cipher uint32, path string, call func(int, uintptr, unsafe.Pointer) error) (*Session, error) {
++	if (len(key) != 16 && len(key) != 24 && len(key) != 32) || (cipher != GCM && cipher != CBC) {
++		return nil, syscall.EINVAL
++	}
++	if sessions.Add(1) > MaxSessions {
++		sessions.Add(-1)
++		return nil, syscall.EMFILE
++	}
++	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CLOEXEC, 0)
++	if err != nil {
++		sessions.Add(-1)
++		return nil, err
++	}
++	d := &Session{fd: fd, cipher: cipher, call: call}
++	success := false
++	defer func() {
++		if !success {
++			d.Close()
++		}
++	}()
++	op := sessionOp{Cipher: cipher, KeyLen: uint32(len(key)), Key: &key[0]}
++	err = call(fd, getSession, unsafe.Pointer(&op))
++	runtime.KeepAlive(key)
++	if err != nil {
++		return nil, err
++	}
++	d.id, d.hasSession = op.Session, true
++	info := sessionInfo{Session: d.id}
++	if err = call(fd, getInfo, unsafe.Pointer(&info)); err != nil {
++		return nil, err
++	}
++	name, driver := "cbc(aes)", "cbc(aes-eip93)"
++	if cipher == GCM {
++		name, driver = "gcm(aes)", "gcm_base(ctr(aes-eip93),ghash-generic)"
++	}
++	// cryptodev selects by generic algorithm name, so verify the actual
++	// implementation rather than relying on its optional driver-only flag.
++	if !bytes.Equal(bytes.TrimRight(info.Cipher.Name[:], "\x00"), []byte(name)) ||
++		!bytes.Equal(bytes.TrimRight(info.Cipher.Driver[:], "\x00"), []byte(driver)) {
++		return nil, errors.New("cryptodev selected an unsupported driver: " + string(bytes.TrimRight(info.Cipher.Driver[:], "\x00")))
++	}
++	mask := info.AlignMask
++	if uint32(mask)&(uint32(mask)+1) != 0 {
++		return nil, syscall.EINVAL
++	}
++	d.buffer = alignedBytes(MaxPayload+16, mask)
++	d.aad = alignedBytes(256, mask)
++	d.iv = alignedBytes(16, mask)
++	success = true
++	return d, nil
++}
++
++func (d *Session) FD() int { return d.fd }
++
++// Exchange keeps all kernel output private. Callers copy it only on success
++// and must Clear after consuming it, including during per-session selftests.
++func (d *Session) Exchange(iv, src, aad []byte, decrypt bool) ([]byte, error) {
++	n, expected := len(src), len(src)
++	if d.cipher == GCM {
++		if decrypt {
++			n -= 16
++			expected -= 16
++		} else {
++			expected += 16
++		}
++		if len(iv) != 12 || len(aad) > 256 {
++			return nil, syscall.EINVAL
++		}
++	} else if len(iv) != 16 || len(aad) != 0 || n%16 != 0 {
++		return nil, syscall.EINVAL
++	}
++	if n < 0 || n > MaxPayload {
++		return nil, syscall.EINVAL
++	}
++	d.bufferUsed = max(d.bufferUsed, len(src), expected)
++	d.aadUsed = max(d.aadUsed, len(aad))
++	copy(d.buffer, src)
++	copy(d.aad, aad)
++	copy(d.iv, iv)
++	op := uint16(0) // COP_ENCRYPT (AF_ALG uses the opposite values).
++	if decrypt {
++		op = 1
++	}
++	var err error
++	if d.cipher == GCM {
++		req := authOp{Session: d.id, Op: op, Len: uint32(len(src)), AuthLen: uint32(len(aad)),
++			AuthSrc: &d.aad[0], Src: &d.buffer[0], Dst: &d.buffer[0], TagLen: 16,
++			IV: &d.iv[0], IVLen: 12}
++		err = d.call(d.fd, authCrypt, unsafe.Pointer(&req))
++		if err == nil && int(req.Len) != expected {
++			err = syscall.EIO
++		}
++	} else {
++		req := cryptOp{Session: d.id, Op: op, Len: uint32(n), Src: &d.buffer[0], Dst: &d.buffer[0], IV: &d.iv[0]}
++		err = d.call(d.fd, crypt, unsafe.Pointer(&req))
++		if err == nil && int(req.Len) != expected {
++			err = syscall.EIO
++		}
++	}
++	runtime.KeepAlive(d)
++	if err != nil {
++		d.Clear()
++		return nil, err
++	}
++	return d.buffer[:expected], nil
++}
++
++func (d *Session) Clear() {
++	clear(d.buffer[:d.bufferUsed])
++	clear(d.aad[:d.aadUsed])
++	clear(d.iv)
++	d.bufferUsed, d.aadUsed = 0, 0
++}
++
++func (d *Session) Close() {
++	if d.fd >= 0 {
++		if d.hasSession {
++			_ = d.call(d.fd, endSession, unsafe.Pointer(&d.id))
++			d.hasSession = false
++		}
++		syscall.Close(d.fd)
++		d.fd = -1
++		sessions.Add(-1)
++	}
++	d.Clear()
++}
+--- a/tools/eip93/devcrypto_linux_test.go.in
++++ b/tools/eip93/devcrypto_linux_test.go.in
+@@ -0,0 +1,209 @@
++// Copyright 2026 The PonWrt Authors.
++// SPDX-License-Identifier: BSD-3-Clause
++//go:build linux && (amd64 || arm64) && !purego
++
++package eip93dev
++
++import (
++	"bytes"
++	"syscall"
++	"testing"
++	"unsafe"
++)
++
++func TestBackendSelection(t *testing.T) {
++	for value, want := range map[string]Backend{"": Auto, "auto": Auto, "devcrypto": Devcrypto, "afalg": AFALG, "off": Off, "typo": Off} {
++		if got := ParseBackend(value); got != want {
++			t.Fatalf("%q: got %d, want %d", value, got, want)
++		}
++	}
++}
++
++func TestCryptodevABI(t *testing.T) {
++	// Values from the cryptodev 1.14 UAPI, independently laid out by a C
++	// compiler. Check offsets as well as sizes to catch ABI-compatible sizes
++	// with incompatible field placement.
++	for name, pair := range map[string][2]uintptr{
++		"session size": {unsafe.Sizeof(sessionOp{}), 48},
++		"session key":  {unsafe.Offsetof(sessionOp{}.Key), 16},
++		"session id":   {unsafe.Offsetof(sessionOp{}.Session), 40},
++		"info size":    {unsafe.Sizeof(sessionInfo{}), 268},
++		"info mask":    {unsafe.Offsetof(sessionInfo{}.AlignMask), 260},
++		"info flags":   {unsafe.Offsetof(sessionInfo{}.Flags), 264},
++		"auth size":    {unsafe.Sizeof(authOp{}), 72},
++		"auth src":     {unsafe.Offsetof(authOp{}.Src), 24},
++		"auth IV":      {unsafe.Offsetof(authOp{}.IV), 56},
++		"crypt size":   {unsafe.Sizeof(cryptOp{}), 48},
++		"crypt src":    {unsafe.Offsetof(cryptOp{}.Src), 16},
++		"crypt IV":     {unsafe.Offsetof(cryptOp{}.IV), 40},
++		"get session":  {getSession, 0xc0306366},
++		"end session":  {endSession, 0x40046367},
++		"get info":     {getInfo, 0xc10c636b},
++		"auth crypt":   {authCrypt, 0xc048636d},
++		"crypt":        {crypt, 0xc0306368},
++	} {
++		if pair[0] != pair[1] {
++			t.Errorf("%s: got %#x, want %#x", name, pair[0], pair[1])
++		}
++	}
++}
++
++// This UAPI model checks marshalling, lengths, driver verification and cleanup.
++// AES correctness is checked separately against Go in the mode hardware tests.
++type model struct {
++	cipher          uint32
++	keyLen          int
++	created, closed int
++	driver          string
++	mask            uint16
++	opErr           error
++	short           bool
++}
++
++func (m *model) call(_ int, request uintptr, arg unsafe.Pointer) error {
++	switch request {
++	case getSession:
++		op := (*sessionOp)(arg)
++		if op.Cipher != m.cipher || op.KeyLen != uint32(m.keyLen) || op.MAC != 0 || op.Key == nil {
++			return syscall.EINVAL
++		}
++		m.created++
++		op.Session = 23
++	case getInfo:
++		op := (*sessionInfo)(arg)
++		if op.Session != 23 {
++			return syscall.EINVAL
++		}
++		name, driver := "cbc(aes)", "cbc(aes-eip93)"
++		if m.cipher == GCM {
++			name, driver = "gcm(aes)", "gcm_base(ctr(aes-eip93),ghash-generic)"
++		}
++		if m.driver != "" {
++			driver = m.driver
++		}
++		copy(op.Cipher.Name[:], name)
++		copy(op.Cipher.Driver[:], driver)
++		op.AlignMask = m.mask
++		// Driver-only flags can be zero for the measured hybrid driver.
++	case endSession:
++		if *(*uint32)(arg) != 23 {
++			return syscall.EINVAL
++		}
++		m.closed++
++	case authCrypt, crypt:
++		var src, dst, iv *byte
++		var n *uint32
++		var direction uint16
++		if request == authCrypt {
++			op := (*authOp)(arg)
++			if m.cipher != GCM || op.Session != 23 || op.IVLen != 12 || op.TagLen != 16 || op.Flags != 0 || op.AuthLen != 5 {
++				return syscall.EINVAL
++			}
++			src, dst, iv, n, direction = op.Src, op.Dst, op.IV, &op.Len, op.Op
++		} else {
++			op := (*cryptOp)(arg)
++			if m.cipher != CBC || op.Session != 23 || op.Flags != 0 || op.MAC != nil {
++				return syscall.EINVAL
++			}
++			src, dst, iv, n, direction = op.Src, op.Dst, op.IV, &op.Len, op.Op
++		}
++		if src != dst || uintptr(unsafe.Pointer(src))&uintptr(m.mask) != 0 || uintptr(unsafe.Pointer(iv))&uintptr(m.mask) != 0 {
++			return syscall.EINVAL
++		}
++		if direction > 1 {
++			return syscall.EINVAL
++		}
++		out := unsafe.Slice(dst, int(*n))
++		if m.opErr != nil {
++			out[0] = 0xff // Model plaintext written before the ioctl reports failure.
++			return m.opErr
++		}
++		for i := range out {
++			out[i] ^= 0x5a
++		}
++		if request == authCrypt {
++			if direction == 0 {
++				*n += 16
++			} else {
++				*n -= 16
++			}
++		}
++		if m.short {
++			*n -= 1
++		}
++	default:
++		return syscall.ENOTTY
++	}
++	return nil
++}
++
++func TestCryptodevTransport(t *testing.T) {
++	for _, cipher := range []uint32{GCM, CBC} {
++		for _, keyLen := range []int{16, 24, 32} {
++			m := &model{cipher: cipher, keyLen: keyLen, mask: 15}
++			d, err := openSession(make([]byte, keyLen), cipher, "/dev/null", m.call)
++			if err != nil {
++				t.Fatal(err)
++			}
++			iv, aad := make([]byte, 16), []byte(nil)
++			if cipher == GCM {
++				iv, aad = iv[:12], make([]byte, 5)
++			}
++			plain := bytes.Repeat([]byte{0x19}, 4096)
++			source := bytes.Clone(plain)
++			got, err := d.Exchange(iv, source, aad, false)
++			if err != nil || len(got) != (4096+map[bool]int{true: 16}[cipher == GCM]) || !bytes.Equal(source, plain) || got[0] != 0x43 {
++				t.Fatalf("encrypt: len=%d err=%v", len(got), err)
++			}
++			ciphertext := bytes.Clone(got)
++			got, err = d.Exchange(iv, ciphertext, aad, true)
++			if err != nil || !bytes.Equal(got, plain) {
++				t.Fatalf("decrypt: %v", err)
++			}
++			for _, failure := range []error{syscall.EIO, syscall.EBADMSG} {
++				m.opErr = failure
++				got, err = d.Exchange(iv, ciphertext, aad, true)
++				if got != nil || err != failure || !bytes.Equal(d.buffer, make([]byte, len(d.buffer))) || !bytes.Equal(d.aad, make([]byte, len(d.aad))) {
++					t.Fatal("error exposed output or retained plaintext")
++				}
++			}
++			m.opErr = nil
++			m.short = true
++			if got, err = d.Exchange(iv, source, aad, false); got != nil || err != syscall.EIO {
++				t.Fatal("wrong result length accepted")
++			}
++			d.Close()
++			d.Close()
++			if m.closed != 1 || sessions.Load() != 0 {
++				t.Fatal("session cleanup")
++			}
++		}
++	}
++}
++
++func TestCryptodevRejectsDriverAndAlignment(t *testing.T) {
++	for _, m := range []*model{
++		{cipher: GCM, keyLen: 16, driver: "gcm-aes-generic"},
++		{cipher: CBC, keyLen: 16, driver: "cbc(aes-eip93)-unexpected"},
++		{cipher: GCM, keyLen: 16, mask: 6},
++	} {
++		if d, err := openSession(make([]byte, 16), m.cipher, "/dev/null", m.call); d != nil || err == nil || m.closed != 1 || sessions.Load() != 0 {
++			t.Fatal("rejection leaked session or accepted unsupported driver/alignment")
++		}
++	}
++}
++
++func TestCryptodevResourceFailures(t *testing.T) {
++	if d, err := Open(make([]byte, 15), GCM); d != nil || err != syscall.EINVAL {
++		t.Fatal("invalid key accepted")
++	}
++	if d, err := openSession(make([]byte, 16), GCM, "/nonexistent-eip93-device", nil); d != nil || err == nil || sessions.Load() != 0 {
++		t.Fatal("open failure leaked reservation")
++	}
++	sessions.Store(MaxSessions)
++	d, err := Open(make([]byte, 16), GCM)
++	count := sessions.Swap(0)
++	if d != nil || err != syscall.EMFILE || count != MaxSessions {
++		t.Fatal("session limit accounting")
++	}
++}
+--- a/tools/eip93/eip93_cbc_linux_arm64.go.in
++++ b/tools/eip93/eip93_cbc_linux_arm64.go.in
+@@ -6,6 +6,7 @@
+ 
+ import (
+ 	"bytes"
++	"crypto/internal/eip93dev"
+ 	"crypto/internal/fips140"
+ 	"crypto/internal/fips140deps/cpu"
+ 	"encoding/binary"
+@@ -26,6 +27,9 @@
+ var eip93CBCAllowed bool
+ var eip93CBCSockets atomic.Int32
+ var eip93CBCNotice sync.Once
++var eip93CBCDevNotice sync.Once
++var eip93CBCFallbackNotice sync.Once
++var eip93CBCSoftwareNotice sync.Once
+ 
+ func eip93CBCCompatible(data []byte) bool {
+ 	if len(data) == 0 || data[len(data)-1] != 0 {
+@@ -45,7 +49,7 @@
+ 
+ func eip93CBCEnabled() bool {
+ 	eip93CBCDetected.Do(func() {
+-		if fips140.Enabled || cpu.ARM64HasAES || os.Getenv("XRAY_EIP93") == "off" {
++		if fips140.Enabled || cpu.ARM64HasAES || eip93dev.Policy() == eip93dev.Off {
+ 			return
+ 		}
+ 		for _, path := range []string{"/sys/firmware/devicetree/base/compatible", "/proc/device-tree/compatible"} {
+@@ -59,8 +63,12 @@
+ }
+ 
+ // CBC modes, including their IVs, are not safe for concurrent use.
+-// Each mode owns an operation socket; CBC and GCM have separate socket limits.
++// Each mode owns a devcrypto session or AF_ALG operation socket. The shared
++// devcrypto session limit is separate from each mode's AF_ALG socket limit.
+ type eip93CBCState struct {
++	mode     eip93dev.Backend
++	dev      *eip93dev.Session
++	devTried bool
+ 	key      [32]byte
+ 	keyLen   int
+ 	fd       int
+@@ -79,7 +87,7 @@
+ 	if keyLen != 16 && keyLen != 24 && keyLen != 32 {
+ 		return nil
+ 	}
+-	s := &eip93CBCState{keyLen: keyLen, fd: -1}
++	s := &eip93CBCState{keyLen: keyLen, fd: -1, mode: eip93dev.Policy()}
+ 	for i := 0; i < keyLen/4; i++ {
+ 		binary.BigEndian.PutUint32(s.key[i*4:], schedule[i])
+ 	}
+@@ -88,7 +96,11 @@
+ }
+ 
+ func (s *eip93CBCState) close() {
+-	if s.fd >= 0 {
++	if s.dev != nil {
++		s.dev.Close()
++		s.dev = nil
++		s.fd = -1
++	} else if s.fd >= 0 {
+ 		syscall.Close(s.fd)
+ 		s.fd = -1
+ 		eip93CBCSockets.Add(-1)
+@@ -113,7 +125,7 @@
+ 	return b
+ }
+ 
+-func (s *eip93CBCState) connect() error {
++func (s *eip93CBCState) connectAFALG() error {
+ 	if eip93CBCSockets.Add(1) > eip93CBCMaxSockets {
+ 		eip93CBCSockets.Add(-1)
+ 		return syscall.EMFILE
+@@ -161,6 +173,9 @@
+ // Keep output private until the entire request succeeds, so software fallback
+ // still sees the original input and IV, even for in-place decryption.
+ func (s *eip93CBCState) exchange(iv *[BlockSize]byte, src []byte, decrypt bool) ([]byte, error) {
++	if s.dev != nil {
++		return s.dev.Exchange(iv[:], src, nil, decrypt)
++	}
+ 	if cap(s.output) < len(src) {
+ 		s.output = make([]byte, len(src))
+ 	} else {
+@@ -190,7 +205,7 @@
+ }
+ 
+ func (s *eip93CBCState) selftest(b *Block, decrypt bool) bool {
+-	defer func() { clear(s.output) }()
++	defer s.clearBuffers()
+ 	var iv [BlockSize]byte
+ 	n, _, errno := syscall.Syscall(syscall.SYS_GETRANDOM, uintptr(unsafe.Pointer(&iv[0])), uintptr(len(iv)), 0)
+ 	if errno != 0 || n != uintptr(len(iv)) {
+@@ -220,21 +235,34 @@
+ 		return false
+ 	}
+ 	defer runtime.KeepAlive(s)
+-	defer func() { clear(s.output) }()
+-	if s.fd < 0 {
+-		if s.connect() != nil || !s.selftest(b, decrypt) {
+-			s.close()
++	defer s.clearBuffers()
++
++	var result []byte
++	for {
++		if s.fd < 0 {
++			if err := s.connect(b, decrypt); err != nil {
++				eip93CBCSoftwareNotice.Do(func() { println("Xray EIP93: AES-CBC backend unavailable; using Go software:", err.Error()) })
++				s.close()
++				s.disabled = true
++				return false
++			}
++		}
++		var err error
++		result, err = s.exchange(iv, src, decrypt)
++		if err == nil {
++			break
++		}
++		wasDev := s.dev != nil
++		s.close()
++		if !wasDev || s.mode != eip93dev.Auto {
++			eip93CBCSoftwareNotice.Do(func() { println("Xray EIP93: AES-CBC backend failed; using Go software:", err.Error()) })
+ 			s.disabled = true
+ 			return false
+ 		}
+-		eip93CBCNotice.Do(func() { println("Xray EIP93: AN7581 AES-CBC backend enabled (AF_ALG)") })
+-	}
+-	result, err := s.exchange(iv, src, decrypt)
+-	if err != nil {
+-		s.close()
+-		s.disabled = true
+-		return false
+-	}
++		eip93CBCFallbackNotice.Do(func() { println("Xray EIP93: AES-CBC devcrypto failed; trying AF_ALG:", err.Error()) })
++		s.restoreKey(b)
++	}
++
+ 	// Save the last ciphertext block before overwriting in-place input.
+ 	nextIV := result[len(result)-BlockSize:]
+ 	if decrypt {
+@@ -244,3 +272,52 @@
+ 	copy(dst, result)
+ 	return true
+ }
++
++func (s *eip93CBCState) clearBuffers() {
++	clear(s.output)
++	if s.dev != nil {
++		s.dev.Clear()
++	}
++}
++
++func (s *eip93CBCState) restoreKey(b *Block) {
++	schedule := EncryptionKeySchedule(b)
++	for i := 0; i < s.keyLen/4; i++ {
++		binary.BigEndian.PutUint32(s.key[i*4:], schedule[i])
++	}
++}
++
++// A session is verified before application data is processed. Once devcrypto
++// fails, auto permanently switches this state to AF_ALG; no per-record probing.
++func (s *eip93CBCState) connect(b *Block, decrypt bool) error {
++	if s.mode != eip93dev.AFALG && !s.devTried {
++		s.devTried = true
++		d, err := eip93dev.Open(s.key[:s.keyLen], eip93dev.CBC)
++		if err == nil {
++			s.dev, s.fd = d, d.FD()
++			if s.selftest(b, decrypt) {
++				clear(s.key[:])
++				eip93CBCDevNotice.Do(func() { println("Xray EIP93: AN7581 AES-CBC backend enabled (devcrypto)") })
++				return nil
++			}
++			err = eip93dev.ErrSelftest
++		}
++		s.close()
++		if s.mode == eip93dev.Devcrypto {
++			return err
++		}
++		eip93CBCFallbackNotice.Do(func() { println("Xray EIP93: AES-CBC devcrypto unavailable; trying AF_ALG:", err.Error()) })
++		s.restoreKey(b)
++	}
++	if s.mode == eip93dev.Devcrypto {
++		return syscall.ENODEV
++	}
++	if err := s.connectAFALG(); err != nil {
++		return err
++	}
++	if !s.selftest(b, decrypt) {
++		return eip93dev.ErrSelftest
++	}
++	eip93CBCNotice.Do(func() { println("Xray EIP93: AN7581 AES-CBC backend enabled (AF_ALG)") })
++	return nil
++}
+--- a/tools/eip93/eip93_cbc_linux_arm64_test.go.in
++++ b/tools/eip93/eip93_cbc_linux_arm64_test.go.in
+@@ -6,6 +6,7 @@
+ 
+ import (
+ 	"bytes"
++	"crypto/internal/eip93dev"
+ 	"fmt"
+ 	"syscall"
+ 	"testing"
+@@ -116,19 +117,23 @@
+ 			}
+ 			// An fd failure must fall back without corrupting in-place input or
+ 			// advancing the IV before software has processed the request.
++			wasDev := enc.eip93.dev != nil && enc.eip93.mode == eip93dev.Auto
+ 			syscall.Close(enc.eip93.fd)
+-			syscall.Close(dec.eip93.fd)
+ 			plain := bytes.Repeat([]byte{0x37}, 8192)
+ 			want := make([]byte, len(plain))
+ 			cryptBlocksEncGeneric(b, &wantIV, want, plain)
+ 			buf := bytes.Clone(plain)
+ 			enc.CryptBlocks(buf, buf)
+-			if !bytes.Equal(buf, want) || enc.iv != wantIV || !enc.eip93.disabled {
++			if !bytes.Equal(buf, want) || enc.iv != wantIV || (enc.eip93.disabled == wasDev) {
+ 				t.Fatal("closed-fd encrypt fallback")
+ 			}
++			syscall.Close(dec.eip93.fd)
+ 			dec.CryptBlocks(buf, buf)
+-			if !bytes.Equal(buf, plain) || dec.iv != wantIV || !dec.eip93.disabled {
++			if !bytes.Equal(buf, plain) || dec.iv != wantIV || (dec.eip93.disabled == wasDev) {
+ 				t.Fatal("closed-fd decrypt fallback")
++			}
++			if wasDev && (enc.eip93.dev != nil || dec.eip93.dev != nil || enc.eip93.fd < 0 || dec.eip93.fd < 0) {
++				t.Fatal("auto did not switch CBC from devcrypto to AF_ALG")
+ 			}
+ 			if !bytes.Equal(enc.eip93.output, make([]byte, len(enc.eip93.output))) ||
+ 				!bytes.Equal(dec.eip93.output, make([]byte, len(dec.eip93.output))) {
+@@ -148,6 +153,7 @@
+ 	b, _ := New(make([]byte, 32))
+ 	c := NewCBCEncrypter(b, [BlockSize]byte{})
+ 	defer c.eip93.close()
++	c.eip93.mode = eip93dev.AFALG
+ 	// The socket gets a different key from the software oracle. Per-key
+ 	// verification must reject it before it can produce application output.
+ 	c.eip93.key[0] ^= 1
+@@ -169,6 +175,7 @@
+ 	b, _ := New(make([]byte, 16))
+ 	c := NewCBCEncrypter(b, [BlockSize]byte{})
+ 	defer c.eip93.close()
++	c.eip93.mode = eip93dev.AFALG
+ 	// Reserve capacity without creating real sockets.
+ 	eip93CBCSockets.Add(eip93CBCMaxSockets)
+ 	defer eip93CBCSockets.Add(-eip93CBCMaxSockets)
+--- a/tools/eip93/eip93_linux_arm64.go.in
++++ b/tools/eip93/eip93_linux_arm64.go.in
+@@ -6,6 +6,7 @@
+ 
+ import (
+ 	"bytes"
++	"crypto/internal/eip93dev"
+ 	"crypto/internal/fips140"
+ 	"crypto/internal/fips140/aes"
+ 	"crypto/internal/fips140deps/cpu"
+@@ -27,6 +28,9 @@
+ var eip93Allowed bool
+ var eip93Sockets atomic.Int32
+ var eip93Notice sync.Once
++var eip93DevNotice sync.Once
++var eip93FallbackNotice sync.Once
++var eip93SoftwareNotice sync.Once
+ 
+ func eip93Compatible(data []byte) bool {
+ 	if len(data) == 0 || data[len(data)-1] != 0 {
+@@ -46,7 +50,7 @@
+ 
+ func eip93Enabled() bool {
+ 	eip93Detected.Do(func() {
+-		if fips140.Enabled || cpu.ARM64HasAES || os.Getenv("XRAY_EIP93") == "off" {
++		if fips140.Enabled || cpu.ARM64HasAES || eip93dev.Policy() == eip93dev.Off {
+ 			return
+ 		}
+ 		for _, path := range []string{"/sys/firmware/devicetree/base/compatible", "/proc/device-tree/compatible"} {
+@@ -61,6 +65,9 @@
+ }
+ 
+ type eip93State struct {
++	mode          eip93dev.Backend
++	dev           *eip93dev.Session
++	devTried      bool
+ 	mu            sync.Mutex
+ 	key           [32]byte
+ 	keyLen        int
+@@ -80,7 +87,7 @@
+ 	if keyLen != 16 && keyLen != 24 && keyLen != 32 {
+ 		return nil
+ 	}
+-	s := &eip93State{keyLen: keyLen, fd: -1}
++	s := &eip93State{keyLen: keyLen, fd: -1, mode: eip93dev.Policy()}
+ 	for i := 0; i < keyLen/4; i++ {
+ 		binary.BigEndian.PutUint32(s.key[i*4:], schedule[i])
+ 	}
+@@ -89,7 +96,11 @@
+ }
+ 
+ func (s *eip93State) close() {
+-	if s.fd >= 0 {
++	if s.dev != nil {
++		s.dev.Close()
++		s.dev = nil
++		s.fd = -1
++	} else if s.fd >= 0 {
+ 		syscall.Close(s.fd)
+ 		s.fd = -1
+ 		eip93Sockets.Add(-1)
+@@ -109,7 +120,7 @@
+ }
+ func eip93U32(v uint32) []byte { b := make([]byte, 4); binary.LittleEndian.PutUint32(b, v); return b }
+ 
+-func (s *eip93State) connect() error {
++func (s *eip93State) connectAFALG() error {
+ 	if eip93Sockets.Add(1) > eip93MaxSockets {
+ 		eip93Sockets.Add(-1)
+ 		return syscall.EMFILE
+@@ -162,6 +173,9 @@
+ // It also never modifies the caller's buffers before a complete operation,
+ // so a syscall failure can safely fall back to the original implementation.
+ func (s *eip93State) exchange(nonce, src, aad []byte, decrypt bool) ([]byte, error) {
++	if s.dev != nil {
++		return s.dev.Exchange(nonce, src, aad, decrypt)
++	}
+ 	inLen := len(aad) + len(src)
+ 	outLen := inLen + 16
+ 	if decrypt {
+@@ -205,13 +219,14 @@
+ }
+ 
+ func (s *eip93State) selftest(g *GCM) bool {
++	defer s.clearBuffers()
+ 	var nonce [12]byte
+ 	n, _, errno := syscall.Syscall(syscall.SYS_GETRANDOM, uintptr(unsafe.Pointer(&nonce[0])), uintptr(len(nonce)), 0)
+ 	if errno != 0 || n != uintptr(len(nonce)) {
+ 		return false
+ 	}
+ 	aad := []byte("EIP93 selftest")
+-	plain := make([]byte, 257)
++	plain := make([]byte, eip93Min)
+ 	for i := range plain {
+ 		plain[i] = byte(i * 7)
+ 	}
+@@ -246,28 +261,84 @@
+ 	if s.disabled {
+ 		return false, false
+ 	}
+-	if s.fd < 0 {
+-		if s.connect() != nil || !s.selftest(g) {
+-			s.close()
+-			clear(s.key[:])
++
++	defer s.clearBuffers()
++	for {
++		if s.fd < 0 {
++			if err := s.connect(g); err != nil {
++				eip93SoftwareNotice.Do(func() { println("Xray EIP93: AES-GCM backend unavailable; using Go software:", err.Error()) })
++				s.close()
++				clear(s.key[:])
++				s.disabled = true
++				return false, false
++			}
++		}
++		result, err := s.exchange(nonce, src, aad, decrypt)
++		if decrypt && err == syscall.EBADMSG {
++			return true, false
++		}
++		if err == nil {
++			copy(out, result)
++			return true, true
++		}
++		wasDev := s.dev != nil
++		s.close()
++		if !wasDev || s.mode != eip93dev.Auto {
++			eip93SoftwareNotice.Do(func() { println("Xray EIP93: AES-GCM backend failed; using Go software:", err.Error()) })
+ 			s.disabled = true
+ 			return false, false
+ 		}
+-		eip93Notice.Do(func() { println("Xray EIP93: AN7581 AES-GCM hybrid backend enabled (AF_ALG CTR + CPU GHASH)") })
+-	}
+-	result, err := s.exchange(nonce, src, aad, decrypt)
+-	if decrypt && err == syscall.EBADMSG {
+-		clear(s.input)
+-		clear(s.output)
+-		return true, false
+-	}
+-	if err != nil {
+-		s.close()
+-		s.disabled = true
+-		return false, false
+-	}
+-	copy(out, result)
++		eip93FallbackNotice.Do(func() { println("Xray EIP93: AES-GCM devcrypto failed; trying AF_ALG:", err.Error()) })
++		s.restoreKey(g)
++	}
++}
++
++func (s *eip93State) clearBuffers() {
+ 	clear(s.input)
+ 	clear(s.output)
+-	return true, true
+-}
++	if s.dev != nil {
++		s.dev.Clear()
++	}
++}
++
++func (s *eip93State) restoreKey(g *GCM) {
++	schedule := aes.EncryptionKeySchedule(&g.cipher)
++	for i := 0; i < s.keyLen/4; i++ {
++		binary.BigEndian.PutUint32(s.key[i*4:], schedule[i])
++	}
++}
++
++// A session is verified before application data is processed. Once devcrypto
++// fails, auto permanently switches this state to AF_ALG; no per-record probing.
++func (s *eip93State) connect(g *GCM) error {
++	if s.mode != eip93dev.AFALG && !s.devTried {
++		s.devTried = true
++		d, err := eip93dev.Open(s.key[:s.keyLen], eip93dev.GCM)
++		if err == nil {
++			s.dev, s.fd = d, d.FD()
++			if s.selftest(g) {
++				clear(s.key[:])
++				eip93DevNotice.Do(func() { println("Xray EIP93: AN7581 AES-GCM hybrid backend enabled (devcrypto CTR + CPU GHASH)") })
++				return nil
++			}
++			err = eip93dev.ErrSelftest
++		}
++		s.close()
++		if s.mode == eip93dev.Devcrypto {
++			return err
++		}
++		eip93FallbackNotice.Do(func() { println("Xray EIP93: AES-GCM devcrypto unavailable; trying AF_ALG:", err.Error()) })
++		s.restoreKey(g)
++	}
++	if s.mode == eip93dev.Devcrypto {
++		return syscall.ENODEV
++	}
++	if err := s.connectAFALG(); err != nil {
++		return err
++	}
++	if !s.selftest(g) {
++		return eip93dev.ErrSelftest
++	}
++	eip93Notice.Do(func() { println("Xray EIP93: AN7581 AES-GCM hybrid backend enabled (AF_ALG CTR + CPU GHASH)") })
++	return nil
++}
+--- a/tools/eip93/eip93_linux_arm64_test.go.in
++++ b/tools/eip93/eip93_linux_arm64_test.go.in
+@@ -6,6 +6,7 @@
+ 
+ import (
+ 	"bytes"
++	"crypto/internal/eip93dev"
+ 	"crypto/internal/fips140/aes"
+ 	"sync"
+ 	"syscall"
+@@ -79,6 +80,24 @@
+ 			if err == nil || out != nil {
+ 				t.Fatal("corrupt tag accepted")
+ 			}
++
++			got[len(got)-1] ^= 1
++			originalDev := g.eip93.dev
++			for _, corruptNonce := range []bool{true, false} {
++				badNonce, badAAD := bytes.Clone(nonce), bytes.Clone(aad)
++				if corruptNonce {
++					badNonce[0] ^= 1
++				} else {
++					badAAD[0] ^= 1
++				}
++				if out, err := g.Open(nil, badNonce, got, badAAD); err == nil || out != nil {
++					t.Fatal("corrupt nonce/AAD accepted")
++				}
++			}
++			out, err = g.Open(nil, nonce, got, aad)
++			if err != nil || !bytes.Equal(out, plain) || g.eip93.dev != originalDev || g.eip93.disabled {
++				t.Fatal("authentication failure changed backend or poisoned valid decryption")
++			}
+ 		}
+ 		if g.eip93.fd < 0 || g.eip93.disabled {
+ 			t.Fatal("hardware failed or fell back")
+@@ -104,14 +123,23 @@
+ 		wg.Wait()
+ 		// A closed operation fd must cause a safe software fallback, without
+ 		// returning partial plaintext or leaking the global socket reservation.
++		wasDev := g.eip93.dev != nil && g.eip93.mode == eip93dev.Auto
+ 		syscall.Close(g.eip93.fd)
+ 		plain := make([]byte, 8192)
+ 		nonce := make([]byte, 12)
+ 		want := make([]byte, len(plain)+16)
+ 		sealGeneric(want, g, nonce, plain, nil)
+-		if got := g.Seal(nil, nonce, plain, nil); !bytes.Equal(got, want) || !g.eip93.disabled {
++		if got := g.Seal(nil, nonce, plain, nil); !bytes.Equal(got, want) {
+ 			t.Fatal("closed-fd fallback")
+ 		}
++		if wasDev {
++			if g.eip93.disabled || g.eip93.dev != nil || g.eip93.fd < 0 {
++				t.Fatal("auto did not switch from devcrypto to AF_ALG")
++			}
++		} else if !g.eip93.disabled {
++			t.Fatal("failed backend was not disabled")
++		}
++		g.eip93.close()
+ 		for _, nt := range [][2]int{{8, 16}, {12, 12}} {
+ 			other, err := New(block, nt[0], nt[1])
+ 			if err != nil || other.eip93 != nil {
+--- a/tools/eip93/overlay.py
++++ b/tools/eip93/overlay.py
+@@ -47,4 +47,12 @@
+ for name in ['eip93_cbc_linux_arm64.go','eip93_cbc_stub.go','eip93_cbc_linux_arm64_test.go']:
+     dst=out/'aes'/name;dst.write_text((Path(__file__).parent/(name+'.in')).read_text())
+     replacements[str(aes_source/name)]=str(dst)
++# This package directory is virtual. Cross-compile tests with -vet=off -c;
++# vet/test out/eip93dev separately without an overlay (vet otherwise chdirs
++# to the nonexistent package directory inside the shared GOROOT).
++dev_source=root/'src/crypto/internal/eip93dev'
++for name in ['devcrypto_linux.go','devcrypto_linux_test.go']:
++    dst=out/'eip93dev'/name;dst.parent.mkdir(parents=True,exist_ok=True)
++    dst.write_text((Path(__file__).parent/(name+'.in')).read_text())
++    replacements[str(dev_source/name)]=str(dst)
+ (out/'overlay.json').write_text(json.dumps({'Replace':replacements},indent=2)+'\n')
