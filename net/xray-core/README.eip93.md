@@ -63,6 +63,23 @@ hardware DMA engine that has hung.
 
 ## Validation
 
+Version 26.10.29 upgrade checks completed with Go 1.27.2 on 2026-10-29:
+
+- The downloaded source archive matches the package SHA256. All three patches
+  (190 GCM, 191 CBC and 192 devcrypto) apply with `--fuzz=0`, without changes.
+- Overlay generation succeeds against Go 1.27.2. The ARM64 Xray binary and
+  AES, GCM, cipher and devcrypto test binaries compile with CGO disabled;
+  the `purego` ARM64 cipher test build also succeeds. Overlay test compilation
+  uses `-vet=off` because the devcrypto package directory is virtual.
+- Host AES/cipher short regressions pass with normal CPU detection and with
+  `GODEBUG=cpu.all=off`. Standalone devcrypto unit tests pass, including backend
+  selection, ABI, mocked transport, driver/alignment and resource failures.
+- Xray `common/crypto` and `infra/conf` short tests pass. The latter uses empty
+  GeoIP/GeoSite fixtures for file-existence checks, not geodata parsing.
+- These checks do not exercise AN7581 hardware or constitute a full OpenWrt
+  package build. On-device acceleration, interoperability and throughput for
+  this version still need verification.
+
 Before this port, an independent AF_ALG diagnostic on Nokia XG-040G-MD (UBI),
 AN7581, PonWrt Linux 6.18.55 passed AES-256 CTR and AES-128/192/256 GCM
 encryption/decryption comparisons against unmodified Go, plus corrupted-tag
