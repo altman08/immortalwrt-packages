@@ -63,6 +63,17 @@ hardware DMA engine that has hung.
 
 ## Validation
 
+Version 26.10.31 upgrade checks completed with Go 1.27.2 on 2026-11-02:
+
+- The downloaded source archive matches the package SHA256. All three patches
+  (190 GCM, 191 CBC and 192 devcrypto) apply with `--fuzz=0`, without changes.
+- Overlay generation and the ARM64 Xray build succeed with CGO disabled.
+- Xray `common/crypto`, `common/protocol/tls` and `proxy/http` short tests,
+  `infra/conf` TUN configuration tests and standalone devcrypto unit tests pass.
+- These checks do not constitute a full OpenWrt package build or exercise
+  AN7581 hardware. On-device acceleration and interoperability remain untested
+  for this version.
+
 Version 26.10.29 upgrade checks completed with Go 1.27.2 on 2026-10-29:
 
 - The downloaded source archive matches the package SHA256. All three patches
