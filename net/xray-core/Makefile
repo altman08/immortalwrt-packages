@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=xray-core
 PKG_VERSION:=26.11.9
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://codeload.github.com/XTLS/Xray-core/tar.gz/v$(PKG_VERSION)?
@@ -16,9 +16,11 @@ PKG_BUILD_DIR:=$(BUILD_DIR)/Xray-core-$(PKG_VERSION)
 PKG_BUILD_DEPENDS:=golang/host
 PKG_BUILD_PARALLEL:=1
 PKG_BUILD_FLAGS:=no-mips16
+PKG_CONFIG_DEPENDS:=CONFIG_PACKAGE_xray-core_INCLUDE_LITE
 
 GO_PKG:=github.com/xtls/xray-core
 GO_PKG_BUILD_PKG:=github.com/xtls/xray-core/main
+GO_PKG_TAGS+=$(if $(CONFIG_PACKAGE_xray-core_INCLUDE_LITE),xray_lite)
 GO_PKG_LDFLAGS_X:= \
 	$(GO_PKG)/core.build=OpenWrt \
 	$(GO_PKG)/core.version=$(PKG_VERSION)
@@ -56,6 +58,19 @@ define Package/xray-example
   TITLE+= (example configs)
   DEPENDS:=xray-core
   PKGARCH:=all
+endef
+
+define Package/xray-core/config
+  config PACKAGE_xray-core_INCLUDE_LITE
+    bool "Build minimal VLESS/REALITY client for Passwall"
+    default n
+    help
+      Keep SOCKS (including HTTP fallback) and tunnel inbounds,
+      VLESS outbound including reverse proxy with RAW/TLS/REALITY,
+      Vision, direct/block outbounds, routing, socket options and JSON config.
+      Exclude other proxy protocols/transports, API, custom DNS, FakeDNS,
+      routing scripts and geodata updater. Unsupported features fail explicitly.
+      ARM64 builds retain the EIP93 overlay. Leave disabled for full Xray.
 endef
 
 define Package/xray/description
